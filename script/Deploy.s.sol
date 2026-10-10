@@ -8,10 +8,12 @@ import {FairOpenHook} from "../src/FairOpenHook.sol";
 
 /// @notice Deploys FairOpenHook.
 /// @dev Targets IMD's PoolManager on Ethereum mainnet, or the canonical V4
-///      PoolManager on Robinhood Chain (chainid 4663). The hook address must
-///      encode the permission flags — mine HOOK_SALT with HookMiner for the
-///      deployer address on the target chain (see test/FairOpenHook.t.sol).
+///      PoolManager on Robinhood Chain (chainid 4663). Deploys via the
+///      canonical CREATE2 proxy so the mined HOOK_SALT holds regardless of
+///      the EOA (see script/MineSalt.s.sol).
 contract Deploy is Script {
+    // canonical keyless CREATE2 deployer (same address on all chains)
+    address constant CREATE2_PROXY = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
     // Ethereum mainnet
     address constant IMD_POOL_MANAGER = 0x000000000004444c5dc75cB358380D2e3dE08A90;
     address constant IMD_ETHEREUM = 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7;
@@ -44,12 +46,16 @@ contract Deploy is Script {
         });
 
         vm.startBroadcast(deployerKey);
-        FairOpenHook hook = new FairOpenHook{salt: salt}(IPoolManager(poolManager), p);
+        bytes memory initCode = abi.encodePacked(type(FairOpenHook).creationCode, abi.encode(IPoolManager(poolManager), p));
+        (bool ok, bytes memory ret) =
+            CREATE2_PROXY.call(abi.encodePacked(salt, initCode));
+        require(ok, "create2 proxy failed");
+        address hookAddr = address(uint160(uint256(bytes32(ret))));
         vm.stopBroadcast();
 
         console.log("chain:", block.chainid);
         console.log("poolManager:", poolManager);
         console.log("pairToken:", pairToken);
-        console.log("FairOpenHook deployed:", address(hook));
+        console.log("FairOpenHook deployed:", hookAddr);
     }
 }
