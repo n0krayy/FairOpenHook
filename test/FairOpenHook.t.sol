@@ -11,16 +11,21 @@ import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
+import {CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {SwapParams, ModifyLiquidityParams} from "v4-core/src/types/PoolOperation.sol";
 import {Deployers} from "v4-core/test/utils/Deployers.sol";
 import {PoolSwapTest} from "v4-core/src/test/PoolSwapTest.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/src/types/BeforeSwapDelta.sol";
+import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 import {HookMiner} from "v4-periphery/test/shared/HookMiner.sol";
 import {FairOpenHook} from "../src/FairOpenHook.sol";
 import {FairOpenHookHarness} from "./FairOpenHookHarness.sol";
 
 contract FairOpenHookTest is Test, Deployers {
     using PoolIdLibrary for PoolKey;
+    using CurrencyLibrary for Currency;
+    using BeforeSwapDeltaLibrary for BeforeSwapDelta;
 
     FairOpenHook hook;
     FairOpenHookHarness harness;
@@ -38,7 +43,7 @@ contract FairOpenHookTest is Test, Deployers {
             windowBlocks: 100,
             baseFee: 3_000, // 0.30%
             maxFee: 900_000, // 90%
-            feeK: 50, // 10% impact -> +5% fee
+            feeK: 150, // 10% impact -> +15% fee (tuned 2026-10-10 via attack-replay: must exceed impact to kill sub-breaker manipulation)
             breakerBps: 2_500, // 25%
             maxBuyPerWallet: 4_500_000 ether,
             cooldownBlocks: 3,
@@ -119,16 +124,16 @@ contract FairOpenHookTest is Test, Deployers {
     }
 
     function test_feeForImpact_scalesLinearly() public view {
-        // feeK=50: 1000 bps impact -> 3000 + 50*1000 = 53_000 pips (5.3%)
-        assertEq(harness.exposedFeeForImpact(1_000), 53_000);
+        // feeK=150: 1000 bps impact -> 3000 + 150*1000 = 153_000 pips (15.3%)
+        assertEq(harness.exposedFeeForImpact(1_000), 153_000);
     }
 
     function test_feeForImpact_capsAtMaxFee() public view {
         assertEq(harness.exposedFeeForImpact(type(uint256).max), 900_000, "saturates, never reverts");
-        // (900000 - 3000) / 50 = 17940 bps is exactly the cap
-        assertEq(harness.exposedFeeForImpact(17_940), 900_000);
-        assertEq(harness.exposedFeeForImpact(17_941), 900_000);
-        assertEq(harness.exposedFeeForImpact(17_939), 899_950);
+        // (900000 - 3000) / 150 = 5980 bps is exactly the cap
+        assertEq(harness.exposedFeeForImpact(5_980), 900_000);
+        assertEq(harness.exposedFeeForImpact(5_981), 900_000);
+        assertEq(harness.exposedFeeForImpact(5_979), 899_850);
     }
 
     // ------------------------------------------------------------------
@@ -175,22 +180,49 @@ contract FairOpenHookTest is Test, Deployers {
     // ------------------------------------------------------------------
 
     // ------------------------------------------------------------------
-    // beforeSwap wiring
+    // beforeSwap wiring — fee split
     // ------------------------------------------------------------------
 
-    function test_beforeSwap_returnsOverrideFee() public {
+    function test_beforeSwap_splitsFee_lPsGetBase_surchargeToHook() public {
+        // via a real swap (direct beforeSwap calls can't mint outside unlock)
         SwapParams memory swapParams = SwapParams({
             zeroForOne: true,
-            amountSpecified: -1 ether,
+            amountSpecified: -0.01 ether,
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+        uint256 impact = harness.exposedEstimateImpactBps(wideKey, swapParams);
+        uint24 totalFee = harness.exposedFeeForImpact(impact);
+        uint256 expectedSurcharge = (0.01 ether * (uint256(totalFee) - 3_000)) / 1_000_000;
+        assertGt(expectedSurcharge, 0, "test setup: expected zero surcharge");
+
+        _swap(wideKey, swapParams);
+
+        // surcharge accrued as ERC6909 claims on the hook
+        assertEq(
+            hook.surchargeAccrued(wideId, wideKey.currency0),
+            expectedSurcharge,
+            "surcharge accrual mismatch"
+        );
+        assertEq(
+            manager.balanceOf(address(hook), wideKey.currency0.toId()),
+            expectedSurcharge,
+            "hook claim balance mismatch"
+        );
+    }
+
+    function test_beforeSwap_noSurcharge_exactOutput() public {
+        // v1: exact-output swaps keep the full fee with LPs (documented limitation)
+        SwapParams memory swapParams = SwapParams({
+            zeroForOne: true,
+            amountSpecified: 1 ether, // exact output
             sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
         });
 
-        (, , uint24 fee) = hook.beforeSwap(address(this), key, swapParams, "");
+        (, BeforeSwapDelta delta, uint24 fee) = hook.beforeSwap(address(this), key, swapParams, "");
 
         assertTrue(fee & LPFeeLibrary.OVERRIDE_FEE_FLAG != 0, "override flag missing");
-        uint256 impact = harness.exposedEstimateImpactBps(key, swapParams);
-        uint24 expected = harness.exposedFeeForImpact(impact);
-        assertEq(fee & ~LPFeeLibrary.OVERRIDE_FEE_FLAG, expected, "fee value mismatch");
+        assertEq(fee & ~LPFeeLibrary.OVERRIDE_FEE_FLAG, 3_000, "LPs must get baseFee");
+        assertEq(delta.getSpecifiedDelta(), 0, "no hook delta on exact output");
     }
 
     // ------------------------------------------------------------------
@@ -383,5 +415,50 @@ contract FairOpenHookTest is Test, Deployers {
         vm.roll(block.number + 101);
         // whale buy far above the cap: allowed once the window closed
         _buy(100 ether); // must not revert
+    }
+
+    // ------------------------------------------------------------------
+    // harvest — surcharge routing to the treasury
+    // ------------------------------------------------------------------
+
+    function test_harvest_routesSurchargeToTreasury() public {
+        address treasury = makeAddr("treasury");
+        FairOpenHook.Params memory p = _defaultParams();
+        p.treasury = treasury;
+        (address hAddr, bytes32 salt) =
+            HookMiner.find(address(this), FLAGS, type(FairOpenHook).creationCode, abi.encode(address(manager), p));
+        FairOpenHook treasuryHook = new FairOpenHook{salt: salt}(IPoolManager(address(manager)), p);
+        assertEq(address(treasuryHook), hAddr);
+
+        (Currency c0, Currency c1) = deployMintAndApprove2Currencies();
+        (PoolKey memory k, PoolId id) =
+            initPool(c0, c1, IHooks(address(treasuryHook)), LPFeeLibrary.DYNAMIC_FEE_FLAG, SQRT_PRICE_1_1);
+        modifyLiquidityRouter.modifyLiquidity(
+            k, ModifyLiquidityParams({tickLower: -6000, tickUpper: 6000, liquidityDelta: 1e24, salt: 0}), ZERO_BYTES
+        );
+
+        // swap with price impact -> surcharge accrues to the hook (input = currency0)
+        // NOTE: needs enough size for impact >= 1 bps against 1e24 liquidity
+        _swap(
+            k,
+            SwapParams({
+                zeroForOne: true,
+                amountSpecified: -1000 ether,
+                sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            })
+        );
+        uint256 accrued = treasuryHook.surchargeAccrued(id, c0);
+        assertGt(accrued, 0, "no surcharge accrued");
+
+        uint256 before = MockERC20(Currency.unwrap(c0)).balanceOf(treasury);
+        treasuryHook.harvest(k);
+        uint256 received = MockERC20(Currency.unwrap(c0)).balanceOf(treasury) - before;
+        assertEq(received, accrued, "treasury did not receive surcharge");
+        assertEq(treasuryHook.surchargeAccrued(id, c0), 0, "accrual not zeroed");
+    }
+
+    function test_harvest_onlyPoolManagerCallback() public {
+        vm.expectRevert(FairOpenHook.OnlyPoolManager.selector);
+        hook.unlockCallback("");
     }
 }

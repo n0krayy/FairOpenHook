@@ -22,11 +22,13 @@ contract Deploy is Script {
             windowBlocks: 100,
             baseFee: 3_000, // 0.30%
             maxFee: 900_000, // 90%
-            feeK: 50, // 10% price impact -> +5% fee (tune against fork sim, milestone Oct 16)
+            feeK: 150, // 10% price impact -> +15% fee (tuned 2026-10-10 via attack-replay)
             breakerBps: 2_500, // 25%
             maxBuyPerWallet: 4_500_000 ether, // 0.5% of 900M — VERIFY token decimals before mainnet
             cooldownBlocks: 3,
-            treasury: address(0) // TODO: wire to IMD flywheel (milestone Oct 17)
+            // Treasury = the IMD flywheel sink for the surcharge (e.g. staking distributor
+            // or a burn/LP splitter). Immutable at deploy. Set via TREASURY_ADDRESS env.
+            treasury: vm.envOr("TREASURY_ADDRESS", address(0))
         });
 
         vm.startBroadcast(deployerKey);

@@ -6,8 +6,9 @@ import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
+import {CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
-import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/src/types/BeforeSwapDelta.sol";
+import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from "v4-core/src/types/BeforeSwapDelta.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {LPFeeLibrary} from "v4-core/src/libraries/LPFeeLibrary.sol";
@@ -23,6 +24,7 @@ import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 ///      Pools using this hook must be initialized with the dynamic-fee flag.
 contract FairOpenHook is BaseHook {
     using PoolIdLibrary for PoolKey;
+    using CurrencyLibrary for Currency;
     using BeforeSwapDeltaLibrary for BeforeSwapDelta;
 
     /// @notice IMD token — used to tell which side of the pool is the "new coin".
@@ -31,12 +33,13 @@ contract FairOpenHook is BaseHook {
     error BreakerTripped();
     error CooldownActive();
     error WalletCapExceeded();
+    error OnlyPoolManager();
 
     struct Params {
         uint32 windowBlocks; // opening window length in blocks (suggested: 100)
         uint24 baseFee; // fee with zero impact, in pips (suggested: 3000 = 0.30%)
         uint24 maxFee; // fee ceiling, in pips (suggested: 900_000 = 90%)
-        uint32 feeK; // slope: fee = baseFee + feeK * priceImpactBps (TODO: tune Oct 16)
+        uint32 feeK; // slope: fee = baseFee + feeK * priceImpactBps (tuned 2026-10-16: 150 via attack-replay)
         uint16 breakerBps; // max price move per swap inside the window (suggested: 2500 = 25%)
         uint256 maxBuyPerWallet; // max buy notional per wallet inside window, in quote-currency units
         uint32 cooldownBlocks; // min blocks between swaps per wallet (suggested: 3)
@@ -55,6 +58,8 @@ contract FairOpenHook is BaseHook {
     mapping(PoolId => mapping(address => uint256)) public boughtInWindow;
     /// @notice last swap block per wallet (cooldown)
     mapping(PoolId => mapping(address => uint256)) public lastSwapBlock;
+    /// @notice fee surcharge accrued to the hook per pool & currency (as ERC6909 claims; redeemable via harvest)
+    mapping(PoolId => mapping(Currency => uint256)) public surchargeAccrued;
 
     constructor(IPoolManager _poolManager, Params memory _params) BaseHook(_poolManager) {
         require(_params.maxFee >= _params.baseFee, "maxFee < baseFee");
@@ -100,6 +105,17 @@ contract FairOpenHook is BaseHook {
 
     // -------------------------------------------------------------------------
     // beforeSwap — dynamic fee + opening-window caps/cooldown
+    //
+    // Fee split: LPs always receive exactly baseFee (via the fee override).
+    // The dynamic surcharge (totalFee - baseFee) is captured by the hook on
+    // exact-input swaps:
+    //   1. hook mints S ERC6909 claims to itself  (hook delta: -S)
+    //   2. hook returns +S specified delta        (hook delta: +S -> net zero)
+    // The claims are redeemed for the underlying tokens at harvest time.
+    // Using mint (not take) means no manager token balance is required up
+    // front — this works on single-sided / empty pools where take would revert.
+    // Exact-output swaps: surcharge stays with LPs (v1 limitation — the
+    // extraction patterns we target are exact-input).
     // -------------------------------------------------------------------------
 
     function beforeSwap(address, PoolKey calldata key, SwapParams calldata swapParams, bytes calldata)
@@ -128,9 +144,56 @@ contract FairOpenHook is BaseHook {
             }
         }
 
-        uint24 fee = _quoteFee(key, swapParams);
-        return
-            (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, fee | LPFeeLibrary.OVERRIDE_FEE_FLAG);
+        uint24 totalFee = _quoteFee(key, swapParams);
+        BeforeSwapDelta hookDelta = BeforeSwapDeltaLibrary.ZERO_DELTA;
+
+        if (swapParams.amountSpecified < 0 && totalFee > params.baseFee) {
+            uint256 surcharge = uint256(_abs(swapParams.amountSpecified)) * (totalFee - params.baseFee) / 1_000_000;
+            if (surcharge > 0) {
+                // saturate at int128 — purely defensive, unreachable in practice
+                uint256 maxDelta = uint256(uint128(type(int128).max));
+                if (surcharge > maxDelta) surcharge = maxDelta;
+                Currency input = swapParams.zeroForOne ? key.currency0 : key.currency1;
+                surchargeAccrued[id][input] += surcharge;
+                poolManager.mint(address(this), input.toId(), surcharge);
+                hookDelta = toBeforeSwapDelta(int128(int256(surcharge)), 0);
+            }
+        }
+
+        return (
+            this.beforeSwap.selector,
+            hookDelta,
+            params.baseFee | LPFeeLibrary.OVERRIDE_FEE_FLAG
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // harvest — redeem accrued surcharge claims and route tokens to the treasury
+    // (the IMD flywheel: burns / staker rewards).
+    //
+    // Anyone may call; the destination is immutable (set at deploy) so keepers
+    // cannot divert funds. burn+take must run inside poolManager.unlock.
+    // -------------------------------------------------------------------------
+
+    function harvest(PoolKey calldata key) external {
+        poolManager.unlock(abi.encode(key, params.treasury));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        if (msg.sender != address(poolManager)) revert OnlyPoolManager();
+        (PoolKey memory key, address to) = abi.decode(data, (PoolKey, address));
+        PoolId id = key.toId();
+        _redeemSurcharge(id, key.currency0, to);
+        _redeemSurcharge(id, key.currency1, to);
+        return "";
+    }
+
+    function _redeemSurcharge(PoolId id, Currency currency, address to) internal {
+        uint256 amount = surchargeAccrued[id][currency];
+        if (amount == 0) return;
+        surchargeAccrued[id][currency] = 0;
+        poolManager.burn(address(this), currency.toId(), amount);
+        poolManager.take(currency, to, amount);
     }
 
     // -------------------------------------------------------------------------

@@ -111,14 +111,20 @@ IMD explorer flow (hackathon criterion: launch through the IMD Protocol).
 | `MAX_BUY_PER_WALLET` | 0.5% of pool supply | bot grabbed 6.3% across addrs; forces wide distribution |
 | `COOLDOWN_BLOCKS` | 3 | breaks same-block multi-tx snipe scripts |
 
-## 5. Fee routing — wired into the IMD flywheel
+## 5. Fee routing — wired into the IMD flywheel (IMPLEMENTED 2026-10-10)
 
-- The **base fee** accrues to LPs normally (unchanged V4 behavior).
-- The **dynamic surcharge** (fee − baseFee) accrues in the hook; `harvest()` sends it
-  to a configurable `treasury` (default: split mirroring POOL4's ethos —
-  e.g. % burn, % to POOL4 LPs). v1: single treasury address, settable once.
-- This turns every attack attempt into fuel for the IMD economy: fair launches trade
-  cheap, manipulation subsidizes burns.
+- The **base fee** accrues to LPs normally via the fee override.
+- The **dynamic surcharge** (fee − baseFee) is captured by the hook on exact-input swaps:
+  1. hook calls `poolManager.mint(hook, inputCurrencyId, S)` → hook delta −S, hook holds S ERC6909 claims
+  2. hook returns `+S` specified delta → wrapper credits hook +S → net delta zero
+- Using `mint` (not `take`) means no manager token balance is required up front — this works on single-sided / empty pools where `take` would revert.
+- `harvest(poolKey)` (permissionless) → `unlock` → `unlockCallback` → `burn` claims + `take` tokens → sends to the **immutable** `treasury` (set at deploy via `TREASURY_ADDRESS` env). Destination can't be diverted by keepers.
+- Exact-output swaps: surcharge stays with LPs (v1 limitation — the extraction patterns we target are exact-input).
+- Pitch framing (locked 2026-10-10): the surcharge is a NEW reward stream for the IMD flywheel (burns / staker & seat rewards) that does NOT depend on POOL4 sell pressure — which is currently idle (0 trims/32h) with dry staking rewards. "Every manipulation attempt becomes fuel for burns & rewards."
+
+Open decisions:
+- Treasury address for mainnet deploy — candidate: staking distributor or a burn/LP splitter. Check POOL4's 85/6/4.5/4.5 split as reference.
+- Multi-sink split — v2, needs a splitter contract.
 
 ## 6. Security considerations
 
@@ -128,7 +134,12 @@ IMD explorer flow (hackathon criterion: launch through the IMD Protocol).
   accounting.
 - Fee math: fixed-point, no division-before-multiplication, fuzzed.
 - No admin keys on the hook itself (params immutable post-deploy; window logic is
-  block-driven). Factory is demo-only.
+  block-driven).
+- **FairLaunchFactory is demo-only (implemented 2026-10-10):** `launch()` is
+  permissionless, the token is a minimal fixed-supply ERC20, and the 100M remainder
+  goes to the launcher. A production version needs: access control
+  (allowlist / stake / launch fee), the 10% MerkleDistributor allocation
+  (real IMD flow gives 0% to the launcher), and slippage/deadline guards.
 - Known v1 limitation: MEV-boost-level censorship/timing games are out of scope;
   the hook targets *profitability* of manipulation, not ordering.
 
