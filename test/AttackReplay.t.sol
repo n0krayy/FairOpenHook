@@ -194,7 +194,8 @@ contract AttackReplay is Test {
             breakerBps: 2_500,
             maxBuyPerWallet: 4_500_000 ether,
             cooldownBlocks: 3,
-            treasury: address(this)
+            treasury: address(this),
+            pairToken: IMD_ADDR
         });
         (address hookAddr, bytes32 salt) = HookMiner.find(
             address(this), FLAGS, type(FairOpenHook).creationCode, abi.encode(address(pm), p)

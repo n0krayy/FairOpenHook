@@ -41,7 +41,7 @@ contract FairLaunchFactoryTest is Test, Deployers {
         fakeIMD.mint(address(this), 1_000_000 ether);
     }
 
-    function _defaultParams() internal pure returns (FairOpenHook.Params memory) {
+    function _defaultParams() internal view returns (FairOpenHook.Params memory) {
         return FairOpenHook.Params({
             windowBlocks: 100,
             baseFee: 3_000,
@@ -50,7 +50,8 @@ contract FairLaunchFactoryTest is Test, Deployers {
             breakerBps: 2_500,
             maxBuyPerWallet: 4_500_000 ether,
             cooldownBlocks: 3,
-            treasury: address(0)
+            treasury: address(0),
+            pairToken: address(fakeIMD)
         });
     }
 
