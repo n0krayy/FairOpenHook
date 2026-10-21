@@ -47,7 +47,8 @@ contract FairOpenHookTest is Test, Deployers {
             breakerBps: 2_500, // 25%
             maxBuyPerWallet: 4_500_000 ether,
             cooldownBlocks: 3,
-            treasury: address(0)
+            treasury: address(0),
+            pairToken: address(0xBEEF) // dummy — mock currencies are never the pair token
         });
     }
 
@@ -109,10 +110,12 @@ contract FairOpenHookTest is Test, Deployers {
             ,
             ,
             ,
-
+            ,
+            address pairToken
         ) = hook.params();
         assertEq(windowBlocks, 100);
         assertEq(baseFee, 3_000);
+        assertEq(pairToken, address(0xBEEF));
     }
 
     // ------------------------------------------------------------------

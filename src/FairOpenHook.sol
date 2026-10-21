@@ -20,15 +20,17 @@ import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 ///         1. dynamic price-impact fee  (kills zero-capital extraction economically)
 ///         2. circuit breaker          (kills it absolutely — reverts the swap)
 ///         3. opening-window wallet caps + cooldown (kills fast sniping)
-/// @dev Designed for IMD's own PoolManager (0x000000000004444c5dc75cb358380d2e3de08a90).
+/// @dev Designed for IMD's PoolManager on Ethereum (0x000000000004444c5dc75cb358380d2e3de08a90)
+///      or the canonical V4 PoolManager on other chains (e.g. Robinhood Chain).
+///      Set pairToken per chain — IMD lives at a different address per chain.
 ///      Pools using this hook must be initialized with the dynamic-fee flag.
 contract FairOpenHook is BaseHook {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
     using BeforeSwapDeltaLibrary for BeforeSwapDelta;
 
-    /// @notice IMD token — used to tell which side of the pool is the "new coin".
-    address public constant IMD = 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7;
+    /// @notice Pair token (e.g. IMD) — used to tell which side of the pool is the "new coin".
+    /// @dev Set per chain at deploy (IMD has a different address per chain).
 
     error BreakerTripped();
     error CooldownActive();
@@ -44,6 +46,7 @@ contract FairOpenHook is BaseHook {
         uint256 maxBuyPerWallet; // max buy notional per wallet inside window, in quote-currency units
         uint32 cooldownBlocks; // min blocks between swaps per wallet (suggested: 3)
         address treasury; // receives the harvested fee surcharge (TODO: wire to IMD flywheel)
+        address pairToken; // quote token of the pair (e.g. IMD) — identifies the "new coin" side
     }
 
     Params public params;
@@ -65,6 +68,7 @@ contract FairOpenHook is BaseHook {
         require(_params.maxFee >= _params.baseFee, "maxFee < baseFee");
         require(_params.maxFee <= 1_000_000, "maxFee > 100%");
         require(_params.breakerBps <= 10_000, "breakerBps > 100%");
+        require(_params.pairToken != address(0), "pairToken not set");
         params = _params;
     }
 
@@ -292,12 +296,12 @@ contract FairOpenHook is BaseHook {
         return opened != 0 && block.number < opened + params.windowBlocks;
     }
 
-    /// @notice true when the swapper is buying the new (non-IMD) token.
+    /// @notice true when the swapper is buying the new (non-pairToken) token.
     /// @dev zeroForOne=true means the swapper GIVES token0 and RECEIVES token1,
     /// so "buying the new token" = receiving it = !zeroForOne when it is token0.
-    function _isBuy(PoolKey calldata key, SwapParams calldata p) internal pure returns (bool) {
-        // Assumes the pool pairs IMD with exactly one new token.
-        bool newTokenIs0 = Currency.unwrap(key.currency0) != IMD;
+    function _isBuy(PoolKey calldata key, SwapParams calldata p) internal view returns (bool) {
+        // Assumes the pool pairs pairToken with exactly one new token.
+        bool newTokenIs0 = Currency.unwrap(key.currency0) != params.pairToken;
         return newTokenIs0 ? !p.zeroForOne : p.zeroForOne;
     }
 
